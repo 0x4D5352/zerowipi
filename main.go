@@ -36,11 +36,11 @@ func main() {
 	fmt.Println("starting...")
 	var wg sync.WaitGroup
 	rawLines := make(chan string, 256)
-	// parsedLines := make(chan NMCLIOutput, 256)
-	wg.Add(2)
+	parsedLines := make(chan NMCLIOutput, 256)
+	wg.Add(3)
 	go scanWAP(rawLines, &wg)
-	go parseWAP(rawLines, &wg)
-	// go parseWAP(rawLines, parsedLines, &wg)
+	go parseWAP(rawLines, parsedLines, &wg)
+	go connectWAP(parsedLines, &wg)
 	wg.Wait()
 	fmt.Println("oh no i stopped running")
 }
@@ -54,7 +54,6 @@ func scanWAP(raw chan string, wg *sync.WaitGroup) {
 		if err != nil {
 			log.Fatalf("failed to exec nmcli: %v", err)
 		}
-		// fmt.Printf("%s\n", out)
 		outString := string(out)
 		if result != outString {
 			result = outString
@@ -67,8 +66,7 @@ func scanWAP(raw chan string, wg *sync.WaitGroup) {
 	}
 }
 
-// func parseWAP(raw chan string, parsed chan NMCLIOutput, wg *sync.WaitGroup) {
-func parseWAP(raw chan string, wg *sync.WaitGroup) {
+func parseWAP(raw chan string, parsed chan NMCLIOutput, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
 		s := <-raw
@@ -122,7 +120,19 @@ func parseWAP(raw chan string, wg *sync.WaitGroup) {
 			InUse:     iu,
 			DBusPath:  splitResult[17],
 		}
-		fmt.Printf("%v+\n", result)
-		// parsed <- result
+		parsed <- result
+	}
+}
+
+func connectWAP(parsed chan NMCLIOutput, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		wap := <-parsed
+		if wap.Security != "--" {
+			fmt.Println("secured AP")
+			fmt.Printf("%v+\n", wap)
+			continue
+		}
+		fmt.Printf("%v+\n", wap)
 	}
 }
