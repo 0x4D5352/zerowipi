@@ -89,3 +89,26 @@ or
 
 I have confirmed that the Raspberry Pi OS Lite version specified above has all
 three of the specified binaries, so should be seen as stable dependencies.
+
+### hurdles discovered
+
+nmcli does not automatically scan, and requires `nmcli device wifi rescan` or
+`nmcli dev wifi list --rescan yes` in order to poll existing results. additionally,
+`nmcli device wifi rescan` requires some sort of root privilege in order to work.
+
+to work around this issue, the following line needs to be added to the polkit rules
+at `/etc/polkit-1/rules.d/10-nm-wifi-san-rules`:
+
+```bash
+polkit.addRule(function(action, subject) {
+  if (action.id == "org.freedesktop.NetworkManager.wifi.scan" &&
+      subject.isInGroup("netdev")) {
+    return polkit.Result.YES;
+  }
+});
+```
+
+once done, run `sudo usermod -aG netdev "$USER"`, then run
+`sudo systemctl restart polkit`
+
+the two commands should work from this point on

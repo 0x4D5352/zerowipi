@@ -50,7 +50,7 @@ func scanWAP(raw chan string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	result := ""
 	for {
-		out, err := exec.Command("nmcli", "-t", "-c", "no", "-f", "ALL", "dev", "wifi", "list").Output()
+		out, err := exec.Command("nmcli", "-t", "-c", "no", "-f", "ALL", "dev", "wifi", "list", "--rescan", "yes").Output()
 		if err != nil {
 			log.Fatalf("failed to exec nmcli: %v", err)
 		}
