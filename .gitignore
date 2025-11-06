@@ -33,3 +33,6 @@ go.work.sum
 
 # MacOS indexer
 .DS_Store
+
+# the bin
+zwp
