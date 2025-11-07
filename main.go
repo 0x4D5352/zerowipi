@@ -1,13 +1,22 @@
 package main
 
 import (
+	// "context"
+	// "database/sql"
 	"fmt"
 	"log"
+
+	// "os"
 	"os/exec"
+
+	// "os/signal"
 	"strconv"
 	"strings"
 	"sync"
+
+	// "syscall"
 	"time"
+	// _ "modernc.org/sqlite"
 )
 
 type NMCLIOutput struct {
@@ -32,44 +41,84 @@ type NMCLIOutput struct {
 }
 
 func main() {
-	// TODO: implement graceful shutdown
 	fmt.Println("starting...")
+	// TODO: implement graceful shutdown
+
+	// ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// defer stop()
+
+	const (
+		rbuf = 256
+		pbuf = 256
+		pw   = 4
+		cw   = 2
+		// bs   = 256
+		// fs   = 10 * time.Millisecond
+	)
+
+	// TODO: add db handling
+
+	// db, err := sql.Open("sqlite", "file:zwp.db?cache=shared&mode=rwc")
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// if _, err := db.Exec(`
+	// PRAGMA journal_mode=WAL;
+	// PRAGMA synchronous=NORMAL;
+	// PARGMA busy_timeout=2000;
+	// `); err != nil {
+	// 	_ = db.Close()
+	// 	log.Fatal(err)
+	// }
+
+	raw := make(chan string, rbuf)
+	parsed := make(chan NMCLIOutput, pbuf)
+
 	var wg sync.WaitGroup
-	rawLines := make(chan string, 256)
-	parsedLines := make(chan NMCLIOutput, 256)
-	wg.Add(3)
-	go scanWAP(rawLines, &wg)
-	go parseWAP(rawLines, parsedLines, &wg)
-	go connectWAP(parsedLines, &wg)
+
+	// TODO: read up on wg.Go() and implement that
+	wg.Add(1)
+	go scanWAP(raw, &wg)
+	for range pw {
+		wg.Add(1)
+		go parseWAP(raw, parsed, &wg)
+	}
+	//TODO: add funtion to spin up DB processing between these two
+	for range cw {
+		wg.Add(1)
+		go FilterWAPSecurity(parsed, &wg)
+	}
 	wg.Wait()
 	fmt.Println("oh no i stopped running")
 }
 
 // TODO: write a comparable version using iwlist and ip -j addr to see if that performs better
-func scanWAP(raw chan string, wg *sync.WaitGroup) {
+func scanWAP(out chan string, wg *sync.WaitGroup) {
 	defer wg.Done()
+	defer close(out)
 	result := ""
 	for {
-		out, err := exec.Command("nmcli", "-t", "-c", "no", "-f", "ALL", "dev", "wifi", "list", "--rescan", "yes").Output()
+		raw, err := exec.Command("nmcli", "-t", "-c", "no", "-f", "ALL", "dev", "wifi", "list", "--rescan", "yes").Output()
 		if err != nil {
 			log.Fatalf("failed to exec nmcli: %v", err)
 		}
-		outString := string(out)
+		outString := string(raw)
 		if result != outString {
 			result = outString
 			lines := strings.Lines(result)
 			for line := range lines {
-				raw <- line
+				// fmt.Println(line)
+				out <- line
 			}
 		}
-		time.Sleep(time.Second * 5)
+		time.Sleep(time.Minute * 1)
 	}
 }
 
-func parseWAP(raw chan string, parsed chan NMCLIOutput, wg *sync.WaitGroup) {
+func parseWAP(in chan string, out chan NMCLIOutput, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
-		s := <-raw
+		s := <-in
 		escapedBSSID := strings.ReplaceAll(s, "\\:", ";")
 		splitResult := strings.Split(escapedBSSID, ":")
 		c, err := strconv.Atoi(splitResult[5])
@@ -120,19 +169,29 @@ func parseWAP(raw chan string, parsed chan NMCLIOutput, wg *sync.WaitGroup) {
 			InUse:     iu,
 			DBusPath:  splitResult[17],
 		}
-		parsed <- result
+		out <- result
 	}
 }
 
-func connectWAP(parsed chan NMCLIOutput, wg *sync.WaitGroup) {
+func FilterWAPSecurity(in chan NMCLIOutput, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
-		wap := <-parsed
-		if wap.Security != "--" {
-			fmt.Println("secured AP")
-			fmt.Printf("%v+\n", wap)
-			continue
+		wap := <-in
+		switch wap.Security {
+		case "--":
+			fallthrough
+		case "":
+			fmt.Printf("Pulic WAP, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+		case "WPA2":
+			fmt.Printf("WPA2 Security, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+		case "WPA":
+			fmt.Printf("WPA Security, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+		case "WPA3":
+			fmt.Printf("WPA3 Security, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+		case "WEP":
+			fmt.Printf("WEP Security, SSID: %s; %s\n", wap.SSID, wap.BSSID)
+		default:
+			fmt.Printf("Unknown Security, SSID: %s; WAP: %s; Security: %s\n", wap.SSID, wap.BSSID, wap.Security)
 		}
-		fmt.Printf("%v+\n", wap)
 	}
 }
