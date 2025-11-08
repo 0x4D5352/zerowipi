@@ -1,21 +1,23 @@
 package main
 
 import (
-	// "context"
 	// "database/sql"
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 
 	// "os"
 	"os/exec"
 
-	// "os/signal"
+	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 
-	// "syscall"
+	"syscall"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 	// _ "modernc.org/sqlite"
 )
 
@@ -41,11 +43,11 @@ type NMCLIOutput struct {
 }
 
 func main() {
-	fmt.Println("starting...")
-	// TODO: implement graceful shutdown
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	logger.Info("starting...")
 
-	// ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	// defer stop()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	const (
 		rbuf = 256
@@ -54,6 +56,7 @@ func main() {
 		cw   = 2
 		// bs   = 256
 		// fs   = 10 * time.Millisecond
+		d = time.Second * 10
 	)
 
 	// TODO: add db handling
@@ -74,124 +77,153 @@ func main() {
 	raw := make(chan string, rbuf)
 	parsed := make(chan NMCLIOutput, pbuf)
 
-	var wg sync.WaitGroup
+	g, ctx := errgroup.WithContext(ctx)
 
-	// TODO: read up on wg.Go() and implement that
-	wg.Add(1)
-	go scanWAP(raw, &wg)
+	g.Go(func() error { return scanWAP(d, raw, ctx, logger) })
 	for range pw {
-		wg.Add(1)
-		go parseWAP(raw, parsed, &wg)
+		g.Go(func() error { return parseWAP(raw, parsed, ctx, logger) })
 	}
 	//TODO: add funtion to spin up DB processing between these two
 	for range cw {
-		wg.Add(1)
-		go FilterWAPSecurity(parsed, &wg)
+		g.Go(func() error { return FilterWAPSecurity(parsed, ctx, logger) })
 	}
-	wg.Wait()
-	fmt.Println("oh no i stopped running")
+	g.Wait()
+	logger.Info("complete")
 }
 
-// TODO: write a comparable version using iwlist and ip -j addr to see if that performs better
-func scanWAP(out chan string, wg *sync.WaitGroup) {
-	defer wg.Done()
+func scanWAP(d time.Duration, out chan string, ctx context.Context, logger *slog.Logger) error {
+	logger.Info("starting scanner")
+	ticker := time.NewTicker(d)
+	defer ticker.Stop()
 	defer close(out)
 	result := ""
-	for {
+	scan := func() error {
+		logger.Debug("starting scan")
 		raw, err := exec.Command("nmcli", "-t", "-c", "no", "-f", "ALL", "dev", "wifi", "list", "--rescan", "yes").Output()
 		if err != nil {
-			log.Fatalf("failed to exec nmcli: %v", err)
+			return fmt.Errorf("failed to exec nmcli: %v", err)
 		}
 		outString := string(raw)
+		logger.Debug("outstring received", "outString", outString)
 		if result != outString {
 			result = outString
 			lines := strings.Lines(result)
 			for line := range lines {
-				// fmt.Println(line)
 				out <- line
 			}
 		}
-		time.Sleep(time.Minute * 1)
+		return nil
+
+	}
+	err := scan()
+	if err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("closing scanner gracefully")
+			return ctx.Err()
+		case <-ticker.C:
+			err := scan()
+			if err != nil {
+				return err
+			}
+		}
 	}
 }
 
-func parseWAP(in chan string, out chan NMCLIOutput, wg *sync.WaitGroup) {
-	defer wg.Done()
+func parseWAP(in chan string, out chan NMCLIOutput, ctx context.Context, logger *slog.Logger) error {
+	defer close(out)
+	logger.Info("starting parser")
 	for {
-		s := <-in
-		escapedBSSID := strings.ReplaceAll(s, "\\:", ";")
-		splitResult := strings.Split(escapedBSSID, ":")
-		c, err := strconv.Atoi(splitResult[5])
-		if err != nil {
-			log.Fatalf("failed to parse WAP channel: %v", err)
+		select {
+		case <-ctx.Done():
+			logger.Info("closing parser gracefully")
+			return ctx.Err()
+		case <-in:
+			s := <-in
+			logger.Debug("line received", "line", s)
+			escapedBSSID := strings.ReplaceAll(s, "\\:", ";")
+			splitResult := strings.Split(escapedBSSID, ":")
+			c, err := strconv.Atoi(splitResult[5])
+			if err != nil {
+				return fmt.Errorf("failed to parse WAP channel: %v", err)
+			}
+			splitFreq := strings.Split(splitResult[6], " ")
+			f, err := strconv.Atoi(splitFreq[0])
+			if err != nil {
+				return fmt.Errorf("failed to parse WAP frequency: %v", err)
+			}
+			splitRate := strings.Split(splitResult[7], " ")
+			r, err := strconv.Atoi(splitRate[0])
+			if err != nil {
+				return fmt.Errorf("failed to parse WAP rate: %v", err)
+			}
+			splitBandwidth := strings.Split(splitResult[8], " ")
+			b, err := strconv.Atoi(splitBandwidth[0])
+			if err != nil {
+				return fmt.Errorf("failed to parse WAP bandwidth: %v", err)
+			}
+			splitSignal := strings.Split(splitResult[9], " ")
+			si, err := strconv.Atoi(splitSignal[0])
+			if err != nil {
+				return fmt.Errorf("failed to parse WAP signal: %v", err)
+			}
+			var iu bool
+			if splitResult[16] == "*" {
+				iu = true
+			}
+			result := NMCLIOutput{
+				Name:      splitResult[0],
+				SSID:      splitResult[1],
+				SSID_Hex:  splitResult[2],
+				BSSID:     strings.ReplaceAll(splitResult[3], ";", ":"),
+				Mode:      splitResult[4],
+				Chan:      c,
+				Freq:      f,
+				Rate:      r,
+				Bandwidth: b,
+				Signal:    si,
+				Bars:      splitResult[10],
+				Security:  splitResult[11],
+				WPAFlags:  splitResult[12],
+				RSNFlags:  splitResult[13],
+				Device:    splitResult[14],
+				Active:    splitResult[15],
+				InUse:     iu,
+				DBusPath:  splitResult[17],
+			}
+			out <- result
 		}
-		splitFreq := strings.Split(splitResult[6], " ")
-		f, err := strconv.Atoi(splitFreq[0])
-		if err != nil {
-			log.Fatalf("failed to parse WAP frequency: %v", err)
-		}
-		splitRate := strings.Split(splitResult[7], " ")
-		r, err := strconv.Atoi(splitRate[0])
-		if err != nil {
-			log.Fatalf("failed to parse WAP rate: %v", err)
-		}
-		splitBandwidth := strings.Split(splitResult[8], " ")
-		b, err := strconv.Atoi(splitBandwidth[0])
-		if err != nil {
-			log.Fatalf("failed to parse WAP bandwidth: %v", err)
-		}
-		splitSignal := strings.Split(splitResult[9], " ")
-		si, err := strconv.Atoi(splitSignal[0])
-		if err != nil {
-			log.Fatalf("failed to parse WAP signal: %v", err)
-		}
-		var iu bool
-		if splitResult[16] == "*" {
-			iu = true
-		}
-		result := NMCLIOutput{
-			Name:      splitResult[0],
-			SSID:      splitResult[1],
-			SSID_Hex:  splitResult[2],
-			BSSID:     strings.ReplaceAll(splitResult[3], ";", ":"),
-			Mode:      splitResult[4],
-			Chan:      c,
-			Freq:      f,
-			Rate:      r,
-			Bandwidth: b,
-			Signal:    si,
-			Bars:      splitResult[10],
-			Security:  splitResult[11],
-			WPAFlags:  splitResult[12],
-			RSNFlags:  splitResult[13],
-			Device:    splitResult[14],
-			Active:    splitResult[15],
-			InUse:     iu,
-			DBusPath:  splitResult[17],
-		}
-		out <- result
 	}
 }
 
-func FilterWAPSecurity(in chan NMCLIOutput, wg *sync.WaitGroup) {
-	defer wg.Done()
+func FilterWAPSecurity(in chan NMCLIOutput, ctx context.Context, logger *slog.Logger) error {
+	logger.Info("starting filter")
 	for {
-		wap := <-in
-		switch wap.Security {
-		case "--":
-			fallthrough
-		case "":
-			fmt.Printf("Pulic WAP, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
-		case "WPA2":
-			fmt.Printf("WPA2 Security, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
-		case "WPA":
-			fmt.Printf("WPA Security, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
-		case "WPA3":
-			fmt.Printf("WPA3 Security, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
-		case "WEP":
-			fmt.Printf("WEP Security, SSID: %s; %s\n", wap.SSID, wap.BSSID)
-		default:
-			fmt.Printf("Unknown Security, SSID: %s; WAP: %s; Security: %s\n", wap.SSID, wap.BSSID, wap.Security)
+		select {
+		case <-ctx.Done():
+			logger.Info("closing filter gracefully")
+			return ctx.Err()
+		case <-in:
+			wap := <-in
+			switch wap.Security {
+			case "--":
+				fmt.Printf("Pulic WAP a, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+			case "":
+				fmt.Printf("Pulic WAP b, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+			case "WPA":
+				fmt.Printf("WPA Security, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+			case "WPA2":
+				fmt.Printf("WPA2 Security, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+			case "WPA3":
+				fmt.Printf("WPA3 Security, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+			case "WEP":
+				fmt.Printf("WEP Security, SSID: %s; %s\n", wap.SSID, wap.BSSID)
+			default:
+				fmt.Printf("Unknown Security, SSID: %s; WAP: %s; Security: %s\n", wap.SSID, wap.BSSID, wap.Security)
+			}
 		}
 	}
 }
