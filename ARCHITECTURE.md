@@ -113,3 +113,10 @@ once done, run `sudo usermod -aG netdev "$USER"`, then run
 `sudo systemctl restart polkit`
 
 the two commands should work from this point on
+
+### improvements to environment
+
+Enabling promiscuous mode allows for greater network data collection - to do this,
+set the following command: `sudo ip link set dev <interface_name> promisc on`
+
+To conduct network scans, nmap needs to be installed on the host operating system.

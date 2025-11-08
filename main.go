@@ -2,7 +2,11 @@ package main
 
 import (
 	// "database/sql"
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -95,46 +99,56 @@ func scanWAP(d time.Duration, out chan string, ctx context.Context, logger *slog
 	logger.Info("starting scanner")
 	ticker := time.NewTicker(d)
 	defer ticker.Stop()
-	defer close(out)
-	result := ""
-	scan := func() error {
+	var lastHash string
+	run := func() []byte {
 		logger.Debug("starting scan")
 		raw, err := exec.Command("nmcli", "-t", "-c", "no", "-f", "ALL", "dev", "wifi", "list", "--rescan", "yes").Output()
 		if err != nil {
-			return fmt.Errorf("failed to exec nmcli: %v", err)
+			logger.Error("failed to exec nmcli", "error", err)
 		}
 		outString := string(raw)
 		logger.Debug("outstring received", "outString", outString)
-		if result != outString {
-			result = outString
-			lines := strings.Lines(result)
-			for line := range lines {
-				out <- line
-			}
-		}
-		return nil
+		return raw
 
 	}
-	err := scan()
-	if err != nil {
-		return err
+	scan := func() {
+		data := run()
+		if len(data) == 0 {
+			return
+		}
+		sum := sha1.Sum(data)
+		hx := hex.EncodeToString(sum[:])
+		if hx == lastHash {
+			return
+		}
+		lastHash = hx
+
+		sc := bufio.NewScanner(bytes.NewReader(data))
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if line == "" {
+				continue
+			}
+			out <- line
+		}
+		if err := sc.Err(); err != nil {
+			logger.Error("io scanner error", "error", err)
+		}
+
 	}
+	scan()
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Info("closing scanner gracefully")
 			return ctx.Err()
 		case <-ticker.C:
-			err := scan()
-			if err != nil {
-				return err
-			}
+			scan()
 		}
 	}
 }
 
 func parseWAP(in chan string, out chan NMCLIOutput, ctx context.Context, logger *slog.Logger) error {
-	defer close(out)
 	logger.Info("starting parser")
 	for {
 		select {
