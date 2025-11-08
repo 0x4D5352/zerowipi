@@ -1,17 +1,16 @@
 package main
 
 import (
-	// "database/sql"
 	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha1"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
 
-	// "os"
 	"os/exec"
 
 	"os/signal"
@@ -22,7 +21,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
-	// _ "modernc.org/sqlite"
+	_ "modernc.org/sqlite"
 )
 
 type NMCLIOutput struct {
@@ -46,6 +45,12 @@ type NMCLIOutput struct {
 	DBusPath  string
 }
 
+type DBChange struct {
+	ID       int64
+	Row      NMCLIOutput
+	Upserted bool
+}
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	logger.Info("starting...")
@@ -53,58 +58,65 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// config settings
 	const (
-		rbuf = 256
-		pbuf = 256
-		pw   = 4
-		cw   = 2
-		// bs   = 256
-		// fs   = 10 * time.Millisecond
-		d = time.Second * 10
+		rawBuffer       = 256
+		parsedBuffer    = 256
+		committedBuffer = 256
+		parserWorkers   = 4
+		filterWorkers   = 2
+		bufferSize      = 256
+		flushEvery      = 10 * time.Millisecond
+		scanEvery       = time.Second * 10
+		connectEvery    = time.Minute * 1
 	)
 
-	// TODO: add db handling
+	db, err := sql.Open("sqlite", "file:zwp.db?cache=shared&mode=rwc")
+	if err != nil {
+		logger.Error("failed to open db", "error", err)
+		os.Exit(1)
+	}
+	if err := initDB(db); err != nil {
+		logger.Error("failed to initialize db schema", "error", err)
+		os.Exit(1)
+	}
+	defer db.Close()
 
-	// db, err := sql.Open("sqlite", "file:zwp.db?cache=shared&mode=rwc")
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// if _, err := db.Exec(`
-	// PRAGMA journal_mode=WAL;
-	// PRAGMA synchronous=NORMAL;
-	// PARGMA busy_timeout=2000;
-	// `); err != nil {
-	// 	_ = db.Close()
-	// 	log.Fatal(err)
-	// }
-
-	raw := make(chan string, rbuf)
-	parsed := make(chan NMCLIOutput, pbuf)
+	raw := make(chan string, rawBuffer)
+	parsed := make(chan NMCLIOutput, parsedBuffer)
+	committed := make(chan DBChange, committedBuffer)
 
 	g, ctx := errgroup.WithContext(ctx)
 
-	g.Go(func() error { return scanWAP(d, raw, ctx, logger) })
-	for range pw {
+	g.Go(func() error { return scanWAP(scanEvery, raw, ctx, logger) })
+	for range parserWorkers {
 		g.Go(func() error { return parseWAP(raw, parsed, ctx, logger) })
 	}
-	//TODO: add funtion to spin up DB processing between these two
-	for range cw {
-		g.Go(func() error { return FilterWAPSecurity(parsed, ctx, logger) })
+	g.Go(func() error { return writeWAPs(parsed, committed, db, bufferSize, flushEvery, ctx, logger) })
+	for range filterWorkers {
+		g.Go(func() error { return FilterWAPSecurity(committed, connectEvery, ctx, logger) })
 	}
-	g.Wait()
+	if err := g.Wait(); err != nil && err != context.Canceled {
+		logger.Error("pipeline stopped with error", "err", err)
+	}
 	logger.Info("complete")
 }
 
 func scanWAP(d time.Duration, out chan string, ctx context.Context, logger *slog.Logger) error {
-	logger.Info("starting scanner")
+	logger.Debug("starting scanner")
+	defer close(out)
 	ticker := time.NewTicker(d)
 	defer ticker.Stop()
 	var lastHash string
 	run := func() []byte {
 		logger.Debug("starting scan")
-		raw, err := exec.Command("nmcli", "-t", "-c", "no", "-f", "ALL", "dev", "wifi", "list", "--rescan", "yes").Output()
+		raw, err := exec.CommandContext(ctx, "nmcli", "-t", "-c", "no", "-f", "ALL", "dev", "wifi", "list", "--rescan", "yes").Output()
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			logger.Error("failed to exec nmcli", "error", err)
+			return nil
 		}
 		outString := string(raw)
 		logger.Debug("outstring received", "outString", outString)
@@ -140,7 +152,7 @@ func scanWAP(d time.Duration, out chan string, ctx context.Context, logger *slog
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("closing scanner gracefully")
+			logger.Debug("closing scanner gracefully")
 			return ctx.Err()
 		case <-ticker.C:
 			scan()
@@ -149,95 +161,269 @@ func scanWAP(d time.Duration, out chan string, ctx context.Context, logger *slog
 }
 
 func parseWAP(in chan string, out chan NMCLIOutput, ctx context.Context, logger *slog.Logger) error {
-	logger.Info("starting parser")
+	logger.Debug("starting parser")
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("closing parser gracefully")
+			logger.Debug("closing parser gracefully")
 			return ctx.Err()
-		case <-in:
-			s := <-in
+		case s, ok := <-in:
+			if !ok {
+				return nil
+			}
 			logger.Debug("line received", "line", s)
-			escapedBSSID := strings.ReplaceAll(s, "\\:", ";")
-			splitResult := strings.Split(escapedBSSID, ":")
-			c, err := strconv.Atoi(splitResult[5])
+			s = strings.TrimSpace(s)
+			if s == "" || strings.HasPrefix(s, "Error:") {
+				continue
+			}
+
+			tmp := strings.ReplaceAll(s, `\:`, "\x00")
+			fields := strings.Split(tmp, ":")
+			if len(fields) < 18 {
+				logger.Warn("incorrect number of fields found", "len(fields)", len(fields), "fields", fields)
+				continue
+			}
+
+			atoiFirst := func(x string, t string) (int, bool) {
+				parts := strings.Fields(x)
+				if len(parts) == 0 {
+					logger.Warn("couldn't parse string", "str", x)
+					return 0, false
+				}
+				n, err := strconv.Atoi(parts[0])
+				if err != nil {
+					logger.Error("failed to parse WAP value", "type", t, "error", err)
+				}
+				return n, err == nil
+
+			}
+
+			c, err := strconv.Atoi(fields[5])
 			if err != nil {
-				return fmt.Errorf("failed to parse WAP channel: %v", err)
+				logger.Error("failed to parse WAP value", "type", "channel", "error", err)
+				continue
 			}
-			splitFreq := strings.Split(splitResult[6], " ")
-			f, err := strconv.Atoi(splitFreq[0])
-			if err != nil {
-				return fmt.Errorf("failed to parse WAP frequency: %v", err)
+			f, ok1 := atoiFirst(fields[6], "frequency")
+			r, ok2 := atoiFirst(fields[7], "rate")
+			b, ok3 := atoiFirst(fields[8], "bandwidth")
+			si, ok4 := atoiFirst(fields[9], "signal")
+			if !ok1 || !ok2 || !ok3 || !ok4 {
+				continue
 			}
-			splitRate := strings.Split(splitResult[7], " ")
-			r, err := strconv.Atoi(splitRate[0])
-			if err != nil {
-				return fmt.Errorf("failed to parse WAP rate: %v", err)
-			}
-			splitBandwidth := strings.Split(splitResult[8], " ")
-			b, err := strconv.Atoi(splitBandwidth[0])
-			if err != nil {
-				return fmt.Errorf("failed to parse WAP bandwidth: %v", err)
-			}
-			splitSignal := strings.Split(splitResult[9], " ")
-			si, err := strconv.Atoi(splitSignal[0])
-			if err != nil {
-				return fmt.Errorf("failed to parse WAP signal: %v", err)
-			}
-			var iu bool
-			if splitResult[16] == "*" {
-				iu = true
-			}
+
 			result := NMCLIOutput{
-				Name:      splitResult[0],
-				SSID:      splitResult[1],
-				SSID_Hex:  splitResult[2],
-				BSSID:     strings.ReplaceAll(splitResult[3], ";", ":"),
-				Mode:      splitResult[4],
+				Name:      fields[0],
+				SSID:      fields[1],
+				SSID_Hex:  fields[2],
+				BSSID:     strings.ReplaceAll(fields[3], "\x00", ":"),
+				Mode:      fields[4],
 				Chan:      c,
 				Freq:      f,
 				Rate:      r,
 				Bandwidth: b,
 				Signal:    si,
-				Bars:      splitResult[10],
-				Security:  splitResult[11],
-				WPAFlags:  splitResult[12],
-				RSNFlags:  splitResult[13],
-				Device:    splitResult[14],
-				Active:    splitResult[15],
-				InUse:     iu,
-				DBusPath:  splitResult[17],
+				Bars:      fields[10],
+				Security:  fields[11],
+				WPAFlags:  fields[12],
+				RSNFlags:  fields[13],
+				Device:    fields[14],
+				Active:    fields[15],
+				InUse:     fields[16] == "*",
+				DBusPath:  fields[17],
 			}
-			out <- result
+			logger.Debug("result parsed", "result", result)
+			select {
+			case out <- result:
+				logger.Debug("sending to out")
+			case <-ctx.Done():
+				return nil
+			}
 		}
 	}
 }
 
-func FilterWAPSecurity(in chan NMCLIOutput, ctx context.Context, logger *slog.Logger) error {
-	logger.Info("starting filter")
+func FilterWAPSecurity(in chan DBChange, idle time.Duration, ctx context.Context, logger *slog.Logger) error {
+	logger.Debug("starting filter")
+	ticker := time.NewTicker(idle)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			logger.Info("closing filter gracefully")
 			return ctx.Err()
-		case <-in:
-			wap := <-in
+		case change, ok := <-in:
+			if !ok {
+				return nil
+			}
+			wap := change.Row
+			logger.Debug("pulling wap from input", "wap", wap)
 			switch wap.Security {
 			case "--":
-				fmt.Printf("Pulic WAP a, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+				logger.Info("Public WAP spotted", "delimiter", "--", "SSID", wap.SSID, "MAC", wap.BSSID, "new", change.Upserted)
 			case "":
-				fmt.Printf("Pulic WAP b, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+				logger.Info("Public WAP spotted", "delimiter", "", "SSID", wap.SSID, "MAC", wap.BSSID, "new", change.Upserted)
 			case "WPA":
-				fmt.Printf("WPA Security, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+				fallthrough
 			case "WPA2":
-				fmt.Printf("WPA2 Security, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+				fallthrough
 			case "WPA3":
-				fmt.Printf("WPA3 Security, SSID: %s; MAC: %s\n", wap.SSID, wap.BSSID)
+				fallthrough
 			case "WEP":
-				fmt.Printf("WEP Security, SSID: %s; %s\n", wap.SSID, wap.BSSID)
+				logger.Info("Protected WAP spotted", "security", wap.Security, "SSID", wap.SSID, "MAC", wap.BSSID, "new", change.Upserted)
 			default:
-				fmt.Printf("Unknown Security, SSID: %s; WAP: %s; Security: %s\n", wap.SSID, wap.BSSID, wap.Security)
+				logger.Info("Unknown WAP spotted", "security", wap.Security, "SSID", wap.SSID, "MAC", wap.BSSID, "new", change.Upserted)
 			}
+		case <-ticker.C:
+			fmt.Println("idle")
 		}
 	}
+}
+
+func initDB(db *sql.DB) error {
+	_, err := db.Exec(`
+		PRAGMA journal_mode=WAL;
+		PRAGMA synchronous=NORMAL;
+		PRAGMA busy_timeout=2000;
+
+		CREATE TABLE IF NOT EXISTS waps(
+		    id INTEGER PRIMARY KEY AUTOINCREMENT,
+		    name TEXT,
+		    ssid TEXT,
+		    ssid_hex TEXT,
+		    bssid TEXT UNIQUE,
+		    mode TEXT,
+		    chan INTEGER,
+		    freq INTEGER,
+		    rate INTEGER,
+		    bandwidth INTEGER,
+		    signal INTEGER,
+		    bars TEXT,
+		    security TEXT,
+		    wpa_flags TEXT,
+		    rsn_flags TEXT,
+		    device TEXT,
+		    active TEXT,
+		    in_use INTEGER,
+		    dbus_path TEXT,
+		    created_at INTEGER,
+		    updated_at INTEGER
+		);
+		CREATE INDEX IF NOT EXISTS idx_waps_ssid ON waps(ssid);
+		`)
+	return err
+}
+
+func writeWAPs(in <-chan NMCLIOutput, out chan<- DBChange, db *sql.DB, batchSize int, flushEvery time.Duration, ctx context.Context, logger *slog.Logger) error {
+	logger.Debug("starting db writer")
+
+	ticker := time.NewTicker(flushEvery)
+	defer ticker.Stop()
+
+	type pending struct{ row NMCLIOutput }
+	batch := make([]pending, 0, batchSize)
+
+	upsertSQL := `
+	INSERT INTO waps
+	(name, ssid, ssid_hex, bssid, mode, chan, freq, rate,
+	bandwidth, signal, bars, security, wpa_flags, rsn_flags,
+	device, active, in_use, dbus_path, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(bssid) DO UPDATE SET
+	  name=excluded.name,
+	  ssid=excluded.ssid,
+	  ssid_hex=excluded.ssid_hex,
+	  mode=excluded.mode,
+	  chan=excluded.chan,
+	  freq=excluded.freq,
+	  rate=excluded.rate,
+	  bandwidth=excluded.bandwidth,
+	  signal=excluded.signal,
+	  bars=excluded.bars,
+	  security=excluded.security,
+	  wpa_flags=excluded.wpa_flags,
+	  rsn_flags=excluded.rsn_flags,
+	  device=excluded.device,
+	  active=excluded.active,
+	  in_use=excluded.in_use,
+	  dbus_path=excluded.dbus_path,
+	  updated_at=excluded.updated_at
+	RETURNING id, (created_at = updated_at) AS was_insert
+	`
+
+	flush := func() {
+		logger.Debug("writing to db!")
+		if len(batch) == 0 {
+			return
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			logger.Error("begin tx failed", "error", err)
+			batch = batch[:0]
+			return
+		}
+		stmt, err := tx.Prepare(upsertSQL)
+		if err != nil {
+			logger.Error("prepare stmt failed", "error", err)
+		}
+
+		now := time.Now().Unix()
+		for _, p := range batch {
+			it := p.row
+			var id int64
+			var wasInsert int64
+			row := stmt.QueryRow(
+				it.Name, it.SSID, it.SSID_Hex, it.BSSID, it.Mode,
+				it.Chan, it.Freq, it.Rate, it.Bandwidth, it.Signal,
+				it.Bars, it.Security, it.WPAFlags, it.RSNFlags,
+				it.Device, it.Active, boolToInt(it.InUse),
+				it.DBusPath, now, now,
+			)
+			if err := row.Scan(&id, &wasInsert); err != nil {
+				logger.Error("upsert failed", "ssid", it.SSID, "error", err)
+				continue
+			}
+			change := DBChange{ID: id, Row: it, Upserted: wasInsert == 1}
+			select {
+			case out <- change:
+			case <-ctx.Done():
+				_ = stmt.Close()
+				_ = tx.Commit()
+				return
+			}
+		}
+
+		_ = stmt.Close()
+		if err := tx.Commit(); err != nil {
+			_ = tx.Rollback()
+			logger.Error("commit failed", "error", err)
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			logger.Debug("closing db writer gracefully")
+			return nil
+		case it, ok := <-in:
+			if !ok {
+				flush()
+				return nil
+			}
+			batch = append(batch, pending{row: it})
+			if len(batch) >= batchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

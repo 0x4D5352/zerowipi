@@ -36,3 +36,5 @@ go.work.sum
 
 # the bin
 zwp
+# the db
+zwp.db

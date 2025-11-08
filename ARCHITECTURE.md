@@ -75,7 +75,9 @@ the implementation of workers 1, 2, 3, 4, and 6. 3 could be excluded if the MVP
 is scaled back to "Scan WAPs, attempt to connect, phone home when successfully
 connected to a WAP"
 
-## Dependencies
+## Discoveries
+
+### dependencies
 
 Network adapters are an operating system level interaction, so this utility will
 require the following linux binaries on the host:
