@@ -7,7 +7,7 @@ import (
 	"crypto/sha1"
 	"database/sql"
 	"encoding/hex"
-	"fmt"
+	// "fmt"
 	"log/slog"
 	"os"
 
@@ -212,6 +212,13 @@ func parseWAP(in chan string, out chan NMCLIOutput, ctx context.Context, logger 
 				continue
 			}
 
+			var sec string
+			if fields[11] == "" {
+				sec = "Open"
+			} else {
+				sec = fields[11]
+			}
+
 			result := NMCLIOutput{
 				Name:      fields[0],
 				SSID:      fields[1],
@@ -224,7 +231,7 @@ func parseWAP(in chan string, out chan NMCLIOutput, ctx context.Context, logger 
 				Bandwidth: b,
 				Signal:    si,
 				Bars:      fields[10],
-				Security:  fields[11],
+				Security:  sec,
 				WPAFlags:  fields[12],
 				RSNFlags:  fields[13],
 				Device:    fields[14],
@@ -248,7 +255,7 @@ func FilterWAPSecurity(in chan DBChange, idle time.Duration, ctx context.Context
 	ticker := time.NewTicker(idle)
 	joinPublicSQL := `
 	SELECT ssid, bssid, updated_at FROM waps
-	WHERE security IN ['--', '']
+	WHERE security = "Open"
 	AND in_use = 0
 	ORDER BY updated_at DESC
 	`
@@ -262,13 +269,16 @@ func FilterWAPSecurity(in chan DBChange, idle time.Duration, ctx context.Context
 			if !ok {
 				return nil
 			}
+			if !change.Upserted {
+				continue
+			}
 			wap := change.Row
 			logger.Debug("pulling wap from input", "wap", wap)
 			switch wap.Security {
 			case "--":
-				logger.Info("Public WAP spotted", "delimiter", "--", "SSID", wap.SSID, "MAC", wap.BSSID, "new", change.Upserted)
+				logger.Info("Public WAP spotted", "delimiter", "--", "SSID", wap.SSID, "MAC", wap.BSSID)
 			case "":
-				logger.Info("Public WAP spotted", "delimiter", "", "SSID", wap.SSID, "MAC", wap.BSSID, "new", change.Upserted)
+				logger.Info("Public WAP spotted", "delimiter", "", "SSID", wap.SSID, "MAC", wap.BSSID)
 			case "WPA":
 				fallthrough
 			case "WPA2":
@@ -276,12 +286,11 @@ func FilterWAPSecurity(in chan DBChange, idle time.Duration, ctx context.Context
 			case "WPA3":
 				fallthrough
 			case "WEP":
-				logger.Info("Protected WAP spotted", "security", wap.Security, "SSID", wap.SSID, "MAC", wap.BSSID, "new", change.Upserted)
+				logger.Info("Protected WAP spotted", "security", wap.Security, "SSID", wap.SSID, "MAC", wap.BSSID)
 			default:
-				logger.Info("Unknown WAP spotted", "security", wap.Security, "SSID", wap.SSID, "MAC", wap.BSSID, "new", change.Upserted)
+				logger.Info("Unknown WAP spotted", "security", wap.Security, "SSID", wap.SSID, "MAC", wap.BSSID)
 			}
 		case <-ticker.C:
-			fmt.Println("idle")
 			rows, err := db.Query(joinPublicSQL)
 			if err != nil {
 				logger.Error("failed to pull rows", "error", err)
@@ -298,7 +307,6 @@ func FilterWAPSecurity(in chan DBChange, idle time.Duration, ctx context.Context
 				}
 				lastSeen := time.Unix(updatedUnixTime, 0)
 				logger.Info("Available Public WAP", "SSID", ssid, "MAC", bssid, "last_seen(local)", lastSeen, "last_seen(UTC)", lastSeen.UTC())
-				logger.Info("This is where i'd fire off connection requests")
 			}
 		}
 	}
