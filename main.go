@@ -315,7 +315,7 @@ func initDB(db *sql.DB) error {
 		    name TEXT,
 		    ssid TEXT,
 		    ssid_hex TEXT,
-		    bssid TEXT UNIQUE,
+		    bssid TEXT UNIQUE NOT NULL,
 		    mode TEXT,
 		    chan INTEGER,
 		    freq INTEGER,
@@ -330,6 +330,7 @@ func initDB(db *sql.DB) error {
 		    active TEXT,
 		    in_use INTEGER,
 		    dbus_path TEXT,
+		    successfully_connected INTEGER,
 		    created_at INTEGER,
 		    updated_at INTEGER
 		);
