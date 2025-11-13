@@ -52,12 +52,6 @@ type DBChange struct {
 }
 
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	logger.Info("starting...")
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
 	// config settings
 	const (
 		rawBuffer       = 256
@@ -69,7 +63,14 @@ func main() {
 		flushEvery      = time.Minute * 1
 		scanEvery       = time.Second * 10
 		connectEvery    = time.Minute * 1
+		logLevel        = slog.LevelInfo
 	)
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
+	logger.Info("starting...")
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	db, err := sql.Open("sqlite", "file:zwp.db?cache=shared&mode=rwc")
 	if err != nil {
