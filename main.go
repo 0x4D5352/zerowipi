@@ -86,17 +86,17 @@ func main() {
 	parsed := make(chan NMCLIOutput, parsedBuffer)
 	committed := make(chan DBChange, committedBuffer)
 
-	g, ctx := errgroup.WithContext(ctx)
+	group, ctx := errgroup.WithContext(ctx)
 
-	g.Go(func() error { return scanWAP(scanEvery, raw, ctx, logger) })
+	group.Go(func() error { return scanWAP(scanEvery, raw, ctx, logger) })
 	for range parserWorkers {
-		g.Go(func() error { return parseWAP(raw, parsed, ctx, logger) })
+		group.Go(func() error { return parseWAP(raw, parsed, ctx, logger) })
 	}
-	g.Go(func() error { return writeWAPs(parsed, committed, db, bufferSize, flushEvery, ctx, logger) })
+	group.Go(func() error { return writeWAPs(parsed, committed, db, bufferSize, flushEvery, ctx, logger) })
 	for range filterWorkers {
-		g.Go(func() error { return FilterWAPSecurity(committed, connectEvery, ctx, logger) })
+		group.Go(func() error { return FilterWAPSecurity(committed, connectEvery, ctx, logger) })
 	}
-	if err := g.Wait(); err != nil && err != context.Canceled {
+	if err := group.Wait(); err != nil && err != context.Canceled {
 		logger.Error("pipeline stopped with error", "err", err)
 	}
 	logger.Info("complete")
