@@ -95,7 +95,7 @@ func main() {
 	}
 	group.Go(func() error { return writeWAPs(parsed, committed, db, bufferSize, flushEvery, ctx, logger) })
 	for range filterWorkers {
-		group.Go(func() error { return FilterWAPSecurity(committed, connectEvery, ctx, logger) })
+		group.Go(func() error { return FilterWAPSecurity(committed, connectEvery, ctx, logger, db) })
 	}
 	if err := group.Wait(); err != nil && err != context.Canceled {
 		logger.Error("pipeline stopped with error", "err", err)
@@ -243,9 +243,15 @@ func parseWAP(in chan string, out chan NMCLIOutput, ctx context.Context, logger 
 	}
 }
 
-func FilterWAPSecurity(in chan DBChange, idle time.Duration, ctx context.Context, logger *slog.Logger) error {
+func FilterWAPSecurity(in chan DBChange, idle time.Duration, ctx context.Context, logger *slog.Logger, db *sql.DB) error {
 	logger.Debug("starting filter")
 	ticker := time.NewTicker(idle)
+	joinPublicSQL := `
+	SELECT ssid, bssid, updated_at FROM waps
+	WHERE security IN ['--', '']
+	AND in_use = 0
+	ORDER BY updated_at DESC
+	`
 	defer ticker.Stop()
 	for {
 		select {
@@ -276,6 +282,24 @@ func FilterWAPSecurity(in chan DBChange, idle time.Duration, ctx context.Context
 			}
 		case <-ticker.C:
 			fmt.Println("idle")
+			rows, err := db.Query(joinPublicSQL)
+			if err != nil {
+				logger.Error("failed to pull rows", "error", err)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var (
+					ssid            string
+					bssid           string
+					updatedUnixTime int64
+				)
+				if err := rows.Scan(&ssid, &bssid, &updatedUnixTime); err != nil {
+					logger.Error("failed to parse row", "error", err)
+				}
+				lastSeen := time.Unix(updatedUnixTime, 0)
+				logger.Info("Available Public WAP", "SSID", ssid, "MAC", bssid, "last_seen(local)", lastSeen, "last_seen(UTC)", lastSeen.UTC())
+				logger.Info("This is where i'd fire off connection requests")
+			}
 		}
 	}
 }
