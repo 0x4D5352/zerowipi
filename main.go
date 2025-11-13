@@ -66,7 +66,7 @@ func main() {
 		parserWorkers   = 4
 		filterWorkers   = 2
 		bufferSize      = 256
-		flushEvery      = 10 * time.Millisecond
+		flushEvery      = time.Minute * 1
 		scanEvery       = time.Second * 10
 		connectEvery    = time.Minute * 1
 	)
