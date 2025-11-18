@@ -94,8 +94,9 @@ func main() {
 	}
 	group.Go(func() error { return writeWAPs(parsed, committed, db, bufferSize, flushEvery, ctx, logger) })
 	for range filterWorkers {
-		group.Go(func() error { return FilterWAPSecurity(committed, connectEvery, ctx, logger, db) })
+		group.Go(func() error { return logWAPs(committed, ctx, logger) })
 	}
+	group.Go(func() error { return connectToPublicWAPs(flushEvery, ctx, logger, db) })
 	if err := group.Wait(); err != nil && err != context.Canceled {
 		logger.Error("pipeline stopped with error", "err", err)
 	}
@@ -249,8 +250,7 @@ func parseWAP(in chan string, out chan NMCLIOutput, ctx context.Context, logger 
 	}
 }
 
-func FilterWAPSecurity(in chan DBChange, idle time.Duration, ctx context.Context, logger *slog.Logger, db *sql.DB) error {
-	logger.Debug("starting filter")
+func connectToPublicWAPs(idle time.Duration, ctx context.Context, logger *slog.Logger, db *sql.DB) error {
 	ticker := time.NewTicker(idle)
 	joinPublicSQL := `
 	SELECT ssid, bssid, updated_at FROM waps
@@ -258,7 +258,66 @@ func FilterWAPSecurity(in chan DBChange, idle time.Duration, ctx context.Context
 	AND in_use = 0
 	ORDER BY updated_at DESC
 	`
+	connect := func(SSID, BSSID string) string {
+		logger.Debug("starting scan")
+		conn := "ssid"
+		name := SSID
+		if name == "" {
+			conn = "bssid"
+			name = BSSID
+		}
+		raw, err := exec.CommandContext(ctx, "nmcli", "dev", "wifi", "connect", "ifname", "wlan0", conn, name).Output()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ""
+			}
+			logger.Error("failed to exec nmcli", "error", err)
+			return ""
+		}
+		outString := string(raw)
+		logger.Debug("outstring received", "outString", outString)
+		return outString
+
+	}
 	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("closing filter gracefully")
+			return ctx.Err()
+		case <-ticker.C:
+			rows, err := db.Query(joinPublicSQL)
+			if err != nil {
+				logger.Error("failed to pull rows", "error", err)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var (
+					SSID            string
+					BSSID           string
+					updatedUnixTime int64
+				)
+				if err := rows.Scan(&SSID, &BSSID, &updatedUnixTime); err != nil {
+					logger.Error("failed to parse row", "error", err)
+				}
+				lastSeen := time.Unix(updatedUnixTime, 0)
+				logger.Info("Available Public WAP", "SSID", SSID, "MAC", BSSID, "last_seen(local)", lastSeen, "last_seen(UTC)", lastSeen.UTC())
+				logger.Info("attempting to connect")
+				result := connect(SSID, BSSID)
+				if result != "successful connection response should go here" {
+					logger.Error("i failed in some sorta way idfk", "cmd result", result)
+					continue
+				}
+				logger.Info("holy shit i actually connected to the WAP")
+				// TODO: attempt to phone home
+			}
+
+		}
+	}
+}
+
+func logWAPs(in chan DBChange, ctx context.Context, logger *slog.Logger) error {
+	logger.Debug("starting filter")
 	for {
 		select {
 		case <-ctx.Done():
@@ -288,24 +347,6 @@ func FilterWAPSecurity(in chan DBChange, idle time.Duration, ctx context.Context
 				logger.Info("Protected WAP spotted", "security", wap.Security, "SSID", wap.SSID, "MAC", wap.BSSID)
 			default:
 				logger.Info("Unknown WAP spotted", "security", wap.Security, "SSID", wap.SSID, "MAC", wap.BSSID)
-			}
-		case <-ticker.C:
-			rows, err := db.Query(joinPublicSQL)
-			if err != nil {
-				logger.Error("failed to pull rows", "error", err)
-			}
-			defer rows.Close()
-			for rows.Next() {
-				var (
-					ssid            string
-					bssid           string
-					updatedUnixTime int64
-				)
-				if err := rows.Scan(&ssid, &bssid, &updatedUnixTime); err != nil {
-					logger.Error("failed to parse row", "error", err)
-				}
-				lastSeen := time.Unix(updatedUnixTime, 0)
-				logger.Info("Available Public WAP", "SSID", ssid, "MAC", bssid, "last_seen(local)", lastSeen, "last_seen(UTC)", lastSeen.UTC())
 			}
 		}
 	}
@@ -337,6 +378,7 @@ func initDB(db *sql.DB) error {
 		    active TEXT,
 		    in_use INTEGER,
 		    dbus_path TEXT,
+		    password TEXT,
 		    successfully_connected INTEGER,
 		    created_at INTEGER,
 		    updated_at INTEGER
