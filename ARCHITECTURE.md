@@ -27,8 +27,8 @@ maintain persistence in the event of shutdown or other disruptions.
 1. WiFi Scanner - Infinite loop, scans for WAPs, sends results if change from prev.
 2. Scan Parser - Takes results from 1, formats values, sends to DB worker.
 3. DB Worker - Two subroutines: loop to handle maintenance, insert/update db table.
-4. WiFi Connector - Wakes on DB changes, iterates through pub APs and tries connections.
-5. WiFi Penetrator - Wakes on DB changes, iteates through priv APs and tries breaking.
+4. WiFi Connector - Infinite loop, iterates through pub APs and tries connections.
+5. WiFi Penetrator - Infinite loop, iteates through priv APs and tries breaking.
 6. Home Dialer - Wakes on successful 4/5, tries to GET home/health.
 7. Nmapper - Wakes on successful 4/5, scans network and saves to local disk.
 8. Data Worker - Wakes on 200 from Home Dialer, sends DB and Nmap results to home
@@ -74,6 +74,20 @@ At a bare minimum, Tasks 1,2, and 4 need to be functional. This would necessitat
 the implementation of workers 1, 2, 3, 4, and 6. 3 could be excluded if the MVP
 is scaled back to "Scan WAPs, attempt to connect, phone home when successfully
 connected to a WAP"
+
+### Implemented
+
+- WiFi Scanner
+- Scan Parser
+- DB Worker
+
+### In Implementation Phase
+
+- WiFi Connector
+
+### To Be Implemented
+
+- Home Dialer
 
 ## Discoveries
 
