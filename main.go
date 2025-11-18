@@ -46,7 +46,6 @@ type NMCLIOutput struct {
 }
 
 type DBChange struct {
-	ID       int64
 	Row      NMCLIOutput
 	Upserted bool
 }
@@ -381,7 +380,7 @@ func writeWAPs(in <-chan NMCLIOutput, out chan<- DBChange, db *sql.DB, batchSize
 	  in_use=excluded.in_use,
 	  dbus_path=excluded.dbus_path,
 	  updated_at=excluded.updated_at
-	RETURNING id, (created_at = updated_at) AS was_insert
+	RETURNING (created_at = updated_at) AS was_insert
 	`
 
 	flush := func() {
@@ -403,7 +402,6 @@ func writeWAPs(in <-chan NMCLIOutput, out chan<- DBChange, db *sql.DB, batchSize
 		now := time.Now().Unix()
 		for _, p := range batch {
 			it := p.row
-			var id int64
 			var wasInsert int64
 			row := stmt.QueryRow(
 				it.Name, it.SSID, it.SSID_Hex, it.BSSID, it.Mode,
@@ -412,11 +410,11 @@ func writeWAPs(in <-chan NMCLIOutput, out chan<- DBChange, db *sql.DB, batchSize
 				it.Device, it.Active, boolToInt(it.InUse),
 				it.DBusPath, now, now,
 			)
-			if err := row.Scan(&id, &wasInsert); err != nil {
+			if err := row.Scan(&wasInsert); err != nil {
 				logger.Error("upsert failed", "ssid", it.SSID, "error", err)
 				continue
 			}
-			change := DBChange{ID: id, Row: it, Upserted: wasInsert == 1}
+			change := DBChange{Row: it, Upserted: wasInsert == 1}
 			select {
 			case out <- change:
 			case <-ctx.Done():
