@@ -116,6 +116,8 @@ once done, run `sudo usermod -aG netdev "$USER"`, then run
 
 the two commands should work from this point on
 
+or y'know, just run this as root
+
 ### improvements to environment
 
 Enabling promiscuous mode allows for greater network data collection - to do this,
