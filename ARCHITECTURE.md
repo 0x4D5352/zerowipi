@@ -138,3 +138,17 @@ Enabling promiscuous mode allows for greater network data collection - to do thi
 set the following command: `sudo ip link set dev <interface_name> promisc on`
 
 To conduct network scans, nmap needs to be installed on the host operating system.
+
+### C2 Server
+
+It would be convenient to bundle the home server into this project, either via:
+
+1. a second command in this project (`zwp-server`/`zwp-c2`/etc)
+2. an optional subcommand that converts the zwp binary from scanner into server.
+
+Considerations for which to choose involve complexity of design, complexity of
+file structure, size of resulting binaries, and obviously performance. On first
+blush, a separate binary seems straightforward and allows me to divide the code
+between each application without impacting the `zwp` binary. This creates some
+complications for installation, but that needs to be weighed against the cost
+of adding in a `zwp serve` or `zwp --serve` flag and the resulting logic changes.
