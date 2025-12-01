@@ -26,8 +26,31 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// NMCLI Status codes - TODO: encode these as consts for error handling
+// 0
+// Success – indicates the operation succeeded.
+// 1
+// Unknown or unspecified error.
+// 2
+// Invalid user input, wrong nmcli invocation.
+// 3
+// Timeout expired (see --wait option).
+// 4
+// Connection activation failed.
+// 5
+// Connection deactivation failed.
+// 6
+// Disconnecting device failed.
+// 7
+// Connection deletion failed.
+// 8
+// NetworkManager is not running.
+// 10
+// Connection, device, or access point does not exist.
+// 65
+// When used with --complete-args option, a file name is expected to follow.
+
 type NMCLIOutput struct {
-	Name      string
 	SSID      string
 	SSID_Hex  string
 	BSSID     string
@@ -37,7 +60,6 @@ type NMCLIOutput struct {
 	Rate      int // in Mbit/s
 	Bandwidth int // in MHz
 	Signal    int
-	Bars      string
 	Security  string
 	WPAFlags  string
 	RSNFlags  string
@@ -54,6 +76,7 @@ type DBChange struct {
 
 func main() {
 	// config settings
+	// TODO: put in a config file instead of main func consts
 	const (
 		rawBuffer       = 256
 		parsedBuffer    = 256
@@ -107,7 +130,7 @@ func main() {
 	for range filterWorkers {
 		group.Go(func() error { return logWAPs(committed, ctx, logger) })
 	}
-	group.Go(func() error { return connectToPublicWAPs(flushEvery, ctx, logger, db) })
+	group.Go(func() error { return connectToPublicWAPs(connectEvery, ctx, logger, db) })
 	if err := group.Wait(); err != nil && err != context.Canceled {
 		logger.Error("pipeline stopped with error", "err", err)
 	}
@@ -120,6 +143,7 @@ func scanWAP(d time.Duration, out chan string, ctx context.Context, logger *slog
 	ticker := time.NewTicker(d)
 	defer ticker.Stop()
 	var lastHash string
+	// these subfunctions could probably be combined, but felt better to split at the time
 	run := func() []byte {
 		logger.Debug("starting scan")
 		raw, err := exec.CommandContext(ctx, "nmcli", "-t", "-c", "no", "-f", "ALL", "dev", "wifi", "list", "--rescan", "yes").Output()
@@ -189,6 +213,7 @@ func parseWAP(in chan string, out chan NMCLIOutput, ctx context.Context, logger 
 				continue
 			}
 
+			// handling escaped colons from BSSID and colon-delimited nmcli output
 			tmp := strings.ReplaceAll(s, `\:`, "\x00")
 			fields := strings.Split(tmp, ":")
 			if len(fields) < 18 {
@@ -196,6 +221,7 @@ func parseWAP(in chan string, out chan NMCLIOutput, ctx context.Context, logger 
 				continue
 			}
 
+			// helper function for certain numeric fields
 			atoiFirst := func(x string, t string) (int, bool) {
 				parts := strings.Fields(x)
 				if len(parts) == 0 {
@@ -231,7 +257,6 @@ func parseWAP(in chan string, out chan NMCLIOutput, ctx context.Context, logger 
 			}
 
 			result := NMCLIOutput{
-				Name:      fields[0],
 				SSID:      fields[1],
 				SSID_Hex:  fields[2],
 				BSSID:     strings.ReplaceAll(fields[3], "\x00", ":"),
@@ -241,7 +266,6 @@ func parseWAP(in chan string, out chan NMCLIOutput, ctx context.Context, logger 
 				Rate:      r,
 				Bandwidth: b,
 				Signal:    si,
-				Bars:      fields[10],
 				Security:  sec,
 				WPAFlags:  fields[12],
 				RSNFlags:  fields[13],
@@ -261,33 +285,34 @@ func parseWAP(in chan string, out chan NMCLIOutput, ctx context.Context, logger 
 	}
 }
 
+// TODO: make this generic and use a strategy pattern to split based on sec protocl
 func connectToPublicWAPs(idle time.Duration, ctx context.Context, logger *slog.Logger, db *sql.DB) error {
 	ticker := time.NewTicker(idle)
 	joinPublicSQL := `
 	SELECT ssid, bssid, updated_at FROM waps
 	WHERE security = "Open"
 	AND in_use = 0
+	AND visible = 1
 	ORDER BY updated_at DESC
+	-- ORDER BY signal DESC
 	`
-	connect := func(SSID, BSSID string) string {
+	connect := func(SSID, BSSID string) (string, error) {
 		logger.Debug("starting scan")
-		conn := "ssid"
 		name := SSID
 		if name == "" {
-			conn = "bssid"
 			name = BSSID
 		}
-		raw, err := exec.CommandContext(ctx, "nmcli", "dev", "wifi", "connect", "ifname", "wlan0", conn, name).Output()
+		raw, err := exec.CommandContext(ctx, "nmcli", "dev", "wifi", "connect", name, "ifname", "wlan0").Output()
 		if err != nil {
 			if ctx.Err() != nil {
-				return ""
+				return "", nil
 			}
 			logger.Error("failed to exec nmcli", "error", err)
-			return ""
+			return "", err
 		}
 		outString := string(raw)
 		logger.Debug("outstring received", "outString", outString)
-		return outString
+		return outString, nil
 
 	}
 	defer ticker.Stop()
@@ -311,18 +336,20 @@ func connectToPublicWAPs(idle time.Duration, ctx context.Context, logger *slog.L
 				if err := rows.Scan(&SSID, &BSSID, &updatedUnixTime); err != nil {
 					logger.Error("failed to parse row", "error", err)
 				}
+				if SSID == "" {
+					continue
+				}
 				lastSeen := time.Unix(updatedUnixTime, 0)
 				logger.Info("Available Public WAP", "SSID", SSID, "MAC", BSSID, "last_seen(local)", lastSeen, "last_seen(UTC)", lastSeen.UTC())
 				logger.Info("attempting to connect")
-				result := connect(SSID, BSSID)
-				if result != "successful connection response should go here" {
-					logger.Error("i failed in some sorta way idfk", "cmd result", result)
+				result, err := connect(SSID, BSSID)
+				if err != nil {
+					logger.Error("i failed in some sorta way idfk", "cmd result", result, "error", err)
 					continue
 				}
 				logger.Info("holy shit i actually connected to the WAP")
 				// TODO: attempt to phone home
 			}
-
 		}
 	}
 }
@@ -344,10 +371,8 @@ func logWAPs(in chan DBChange, ctx context.Context, logger *slog.Logger) error {
 			wap := change.Row
 			logger.Debug("pulling wap from input", "wap", wap)
 			switch wap.Security {
-			case "--":
-				logger.Info("Public WAP spotted", "delimiter", "--", "SSID", wap.SSID, "MAC", wap.BSSID)
-			case "":
-				logger.Info("Public WAP spotted", "delimiter", "", "SSID", wap.SSID, "MAC", wap.BSSID)
+			case "Open":
+				logger.Info("Public WAP spotted", "SSID", wap.SSID, "MAC", wap.BSSID, "mode", wap.Mode)
 			case "WPA":
 				fallthrough
 			case "WPA2":
@@ -355,9 +380,9 @@ func logWAPs(in chan DBChange, ctx context.Context, logger *slog.Logger) error {
 			case "WPA3":
 				fallthrough
 			case "WEP":
-				logger.Info("Protected WAP spotted", "security", wap.Security, "SSID", wap.SSID, "MAC", wap.BSSID)
+				logger.Info("Protected WAP spotted", "security", wap.Security, "SSID", wap.SSID, "MAC", wap.BSSID, "mode", wap.Mode)
 			default:
-				logger.Info("Unknown WAP spotted", "security", wap.Security, "SSID", wap.SSID, "MAC", wap.BSSID)
+				logger.Info("Unknown WAP spotted", "security", wap.Security, "SSID", wap.SSID, "MAC", wap.BSSID, "mode", wap.Mode)
 			}
 		}
 	}
@@ -368,10 +393,9 @@ func initDB(db *sql.DB) error {
 		PRAGMA journal_mode=WAL;
 		PRAGMA synchronous=NORMAL;
 		PRAGMA busy_timeout=2000;
-
+		PRAGMA foreign_keys = ON;
 		CREATE TABLE IF NOT EXISTS waps(
 		    id INTEGER PRIMARY KEY AUTOINCREMENT,
-		    name TEXT,
 		    ssid TEXT,
 		    ssid_hex TEXT,
 		    bssid TEXT UNIQUE NOT NULL,
@@ -381,7 +405,6 @@ func initDB(db *sql.DB) error {
 		    rate INTEGER,
 		    bandwidth INTEGER,
 		    signal INTEGER,
-		    bars TEXT,
 		    security TEXT,
 		    wpa_flags TEXT,
 		    rsn_flags TEXT,
@@ -392,9 +415,16 @@ func initDB(db *sql.DB) error {
 		    password TEXT,
 		    successfully_connected INTEGER,
 		    created_at INTEGER,
-		    updated_at INTEGER
+		    updated_at INTEGER,
+		    visible INTEGER
 		);
 		CREATE INDEX IF NOT EXISTS idx_waps_ssid ON waps(ssid);
+		CREATE TABLE IF NOT EXISTS passwords(
+		    id INTEGER PRIMARY KEY AUTOINCREMENT,
+		    wap_id INTEGER NOT NULL,
+		    password TEXT,
+		    FOREIGN KEY (wap_id) REFERENCES waps(id) ON DELETE CASCADE
+		);
 		`)
 	return err
 }
@@ -410,12 +440,11 @@ func writeWAPs(in <-chan NMCLIOutput, out chan<- DBChange, db *sql.DB, batchSize
 
 	upsertSQL := `
 	INSERT INTO waps
-	(name, ssid, ssid_hex, bssid, mode, chan, freq, rate,
-	bandwidth, signal, bars, security, wpa_flags, rsn_flags,
-	device, active, in_use, dbus_path, created_at, updated_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	(ssid, ssid_hex, bssid, mode, chan, freq, rate,
+	bandwidth, signal, security, wpa_flags, rsn_flags,
+	device, active, in_use, dbus_path, created_at, updated_at, visible)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
 	ON CONFLICT(bssid) DO UPDATE SET
-	  name=excluded.name,
 	  ssid=excluded.ssid,
 	  ssid_hex=excluded.ssid_hex,
 	  mode=excluded.mode,
@@ -424,7 +453,6 @@ func writeWAPs(in <-chan NMCLIOutput, out chan<- DBChange, db *sql.DB, batchSize
 	  rate=excluded.rate,
 	  bandwidth=excluded.bandwidth,
 	  signal=excluded.signal,
-	  bars=excluded.bars,
 	  security=excluded.security,
 	  wpa_flags=excluded.wpa_flags,
 	  rsn_flags=excluded.rsn_flags,
@@ -432,9 +460,16 @@ func writeWAPs(in <-chan NMCLIOutput, out chan<- DBChange, db *sql.DB, batchSize
 	  active=excluded.active,
 	  in_use=excluded.in_use,
 	  dbus_path=excluded.dbus_path,
-	  updated_at=excluded.updated_at
+	  updated_at=excluded.updated_at,
+	  visible=1
 	RETURNING (created_at = updated_at) AS was_insert
 	`
+	boolToInt := func(b bool) int {
+		if b {
+			return 1
+		}
+		return 0
+	}
 
 	flush := func() {
 		logger.Debug("writing to db!")
@@ -457,9 +492,9 @@ func writeWAPs(in <-chan NMCLIOutput, out chan<- DBChange, db *sql.DB, batchSize
 			it := p.row
 			var wasInsert int64
 			row := stmt.QueryRow(
-				it.Name, it.SSID, it.SSID_Hex, it.BSSID, it.Mode,
+				it.SSID, it.SSID_Hex, it.BSSID, it.Mode,
 				it.Chan, it.Freq, it.Rate, it.Bandwidth, it.Signal,
-				it.Bars, it.Security, it.WPAFlags, it.RSNFlags,
+				it.Security, it.WPAFlags, it.RSNFlags,
 				it.Device, it.Active, boolToInt(it.InUse),
 				it.DBusPath, now, now,
 			)
@@ -504,11 +539,4 @@ func writeWAPs(in <-chan NMCLIOutput, out chan<- DBChange, db *sql.DB, batchSize
 			flush()
 		}
 	}
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }
