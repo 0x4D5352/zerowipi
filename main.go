@@ -7,6 +7,8 @@ import (
 	"crypto/sha1"
 	"database/sql"
 	"encoding/hex"
+	"io"
+
 	// "fmt"
 	"log/slog"
 	"os"
@@ -59,13 +61,22 @@ func main() {
 		parserWorkers   = 4
 		filterWorkers   = 2
 		bufferSize      = 256
-		flushEvery      = time.Minute * 1
-		scanEvery       = time.Second * 10
+		flushEvery      = time.Second * 1
+		scanEvery       = time.Second * 30
 		connectEvery    = time.Minute * 1
 		logLevel        = slog.LevelInfo
 	)
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel}))
+	f, err := os.OpenFile("zwp.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		slog.Error("failed to open log file", "error", err)
+		return
+	}
+	defer f.Close()
+	multiWriter := io.MultiWriter(f, os.Stderr)
+	handler := slog.NewTextHandler(multiWriter, &slog.HandlerOptions{Level: logLevel})
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
 	logger.Info("starting...")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
