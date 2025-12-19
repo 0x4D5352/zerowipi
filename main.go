@@ -26,29 +26,20 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// NMCLI Status codes - TODO: encode these as consts for error handling
-// 0
-// Success – indicates the operation succeeded.
-// 1
-// Unknown or unspecified error.
-// 2
-// Invalid user input, wrong nmcli invocation.
-// 3
-// Timeout expired (see --wait option).
-// 4
-// Connection activation failed.
-// 5
-// Connection deactivation failed.
-// 6
-// Disconnecting device failed.
-// 7
-// Connection deletion failed.
-// 8
-// NetworkManager is not running.
-// 10
-// Connection, device, or access point does not exist.
-// 65
-// When used with --complete-args option, a file name is expected to follow.
+// NMCLI Exit Codes
+const (
+	ExitSuccess                           = 0  // Success - indicats the operation succeeded.
+	ExitUnknownError                      = 1  // Unknown or unspecified error.
+	ExitInvalidInputError                 = 2  // Invalid user input, wrong nmcli invocation.
+	ExitTimeoutError                      = 3  // Timeout expired (see --wait option).
+	ExitConnectionActivationFailedError   = 4  // Connection activation failed.
+	ExitConnectionDeactivationFailedError = 5  // Connection deactivation failed.
+	ExitDisconnectFailedError             = 6  // Disconnecting device failed
+	ExitConnectionDeletionFailedError     = 7  // Connection deletion failed.
+	ExitNetworkManagerNotRunningError     = 8  // NetworkManager is not running.
+	ExitDoesNotExistError                 = 10 // Connection, device, or access point does not exist.
+	ExitFileNameExpectedError             = 65 // When used with --complete-args option, a file name is expected to follow.
+)
 
 type NMCLIOutput struct {
 	SSID      string
